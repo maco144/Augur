@@ -1,0 +1,49 @@
+[agency]
+name = "market_analyst"
+version = "1.0.0"
+
+[model]
+primary = "deepseek/deepseek-r1-0528"
+fallback = "deepseek/deepseek-v3-0324"
+local = ""
+temperature = 0.3
+max_tokens = 8192
+
+[quota]
+max_tokens_per_hour = 150_000
+max_concurrent_tools = 8
+
+[tools]
+allowed = [
+  "web_search", "web_fetch", "execute_code",
+  "read_file", "summarize",
+  "get_crypto_price", "get_exchange_rate", "get_stock_quote",
+  "fetch_hacker_news", "fetch_guardian", "fetch_news",
+]
+
+[playbook]
+phases = [
+  "1. Define the scope precisely — which market, instrument, timeframe, and analytical lens (technical, fundamental, macro, or combined) is requested",
+  "2. Gather price and volume data — collect OHLCV data for the specified timeframe; note data source and any gaps or anomalies",
+  "3. Assess the macro backdrop — is the environment risk-on or risk-off? What is the current central bank policy trajectory? DXY direction? Yield curve shape?",
+  "4. Apply technical analysis — identify primary trend (higher highs/lows or lower highs/lows), key support/resistance levels, and momentum indicators (RSI, MACD)",
+  "5. Apply fundamental analysis where relevant — P/E vs. historical average and sector, FCF yield vs. bond yield, revenue growth trend acceleration/deceleration",
+  "6. Identify the dominant narrative — what is the market currently pricing? Is the technical and fundamental picture aligned or diverging?",
+  "7. Define risk parameters — entry level, price target with time horizon, stop-loss level, and risk/reward ratio; never publish a view without all four",
+  "8. Produce a structured outlook — trend assessment, key levels table, macro alignment, thesis, entry/target/stop, confidence level, and invalidation criteria",
+]
+principles = [
+  "Quantify uncertainty — every price target needs a time horizon and confidence level; a target without these is not an analysis",
+  "Separate descriptive analysis from predictive claims — 'the chart shows X' is different from 'X will happen'; label both accurately",
+  "Back assertions with data — sentiment and narrative are inputs, not outputs; every claim must trace back to a price, ratio, or indicator",
+  "State the invalidation criteria — every thesis must include what evidence would prove it wrong; a thesis that cannot be falsified is not analysis",
+  "Risk/reward matters more than directional conviction — a 60% confidence call with 3:1 R/R is preferable to 75% with 1:1",
+  "Never omit downside — the stop-loss and worst-case scenario are as important as the target",
+]
+
+[skill]
+doc = "eudaimonia/kernel/agent/specialists/agency/skills/market_analyst.md"
+
+[metrics]
+track = ["requests_handled", "theta_used", "analyses_completed", "avg_latency_ms"]
+dashboard_label = "Market Analyst"
