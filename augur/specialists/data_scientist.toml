@@ -3,7 +3,7 @@ name = "data_scientist"
 version = "1.0.0"
 
 [model]
-primary = "deepseek/deepseek-r1-0528"
+primary = "claude-sonnet-4-6"
 fallback = "deepseek/deepseek-v3-0324"
 local = "tomng/nanbeige4.1:3b"
 temperature = 0.3

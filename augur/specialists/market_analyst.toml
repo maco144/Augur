@@ -3,8 +3,8 @@ name = "market_analyst"
 version = "1.0.0"
 
 [model]
-primary = "deepseek/deepseek-r1-0528"
-fallback = "deepseek/deepseek-v3-0324"
+primary = "gpt-4o"
+fallback = "gpt-4o-mini"
 local = ""
 temperature = 0.3
 max_tokens = 8192

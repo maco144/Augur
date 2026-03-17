@@ -7,6 +7,7 @@ with full per-specialist reasoning chains.
 
 Each specialist:
   - Receives the question + their own domain playbook as system prompt
+  - Runs on its TOML-declared model via the multi-provider router (Anthropic, OpenAI, Google, OpenRouter)
   - Returns structured JSON: {probability, confidence, reasoning, assumptions, uncertainties}
   - Runs in parallel (asyncio.gather) with an independent timeout per specialist
   - Falls back gracefully if a specialist errors or times out
@@ -19,13 +20,15 @@ Aggregation:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
 import tomllib
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
+
+from .response_parser import parse_specialist_response
+from .router import Provider, available_providers, detect_provider, resolve_model, send_message
 
 logger = logging.getLogger(__name__)
 
@@ -153,29 +156,43 @@ def weighted_average(estimates: list) -> tuple[float, float]:
 # Per-specialist LLM call
 # ---------------------------------------------------------------------------
 
+_ERROR_RESULT = {
+    "probability": 0.5, "confidence": 0.0,
+    "key_assumptions": [], "key_uncertainties": [],
+    "would_change_if": None,
+}
+
+
 async def call_specialist(
     name: str,
     question: str,
     context: Optional[str],
     timeout_seconds: int,
-    api_key: str,
 ) -> dict:
-    """Run one specialist forecast via direct Anthropic API call."""
-    import anthropic
-
+    """Run one specialist forecast via its TOML-declared model and provider."""
     config = load_toml(name)
     if not config:
         return {
-            "specialist": name, "probability": 0.5, "confidence": 0.0,
+            "specialist": name, "model": "",
             "reasoning": "Specialist manifest not found.",
-            "key_assumptions": [], "key_uncertainties": [],
-            "would_change_if": None,
             "status": "api_error", "latency_ms": 0.0,
+            **_ERROR_RESULT,
+        }
+
+    model_cfg = config.get("model", {})
+    try:
+        model, provider = resolve_model(model_cfg)
+    except RuntimeError as exc:
+        return {
+            "specialist": name, "model": "",
+            "reasoning": f"No provider available: {exc}",
+            "status": "api_error", "latency_ms": 0.0,
+            **_ERROR_RESULT,
         }
 
     system_prompt = build_system_prompt(name, config)
-    model_cfg = config.get("model", {})
-    model = "claude-sonnet-4-6"
+    temperature = float(model_cfg.get("temperature", 0.4))
+    max_tokens = int(model_cfg.get("max_tokens", 1024))
 
     user_message = f"QUESTION: {question}"
     if context:
@@ -183,69 +200,40 @@ async def call_specialist(
 
     t0 = time.time()
     try:
-        client = anthropic.AsyncAnthropic(api_key=api_key)
-        response = await asyncio.wait_for(
-            client.messages.create(
-                model=model,
-                max_tokens=1024,
-                temperature=float(model_cfg.get("temperature", 0.4)),
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
-            ),
+        raw = await send_message(
+            model=model,
+            provider=provider,
+            system=system_prompt,
+            user=user_message,
+            temperature=temperature,
+            max_tokens=max_tokens,
             timeout=timeout_seconds,
         )
-        latency_ms = (time.time() - t0) * 1000
-        raw = response.content[0].text.strip()
+        latency_ms = round((time.time() - t0) * 1000, 1)
 
-        # Strip markdown fences if the model added them
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        parsed = json.loads(raw)
-        return {
-            "specialist": name,
-            "probability": float(parsed.get("probability", 0.5)),
-            "confidence": float(parsed.get("confidence", 0.5)),
-            "reasoning": str(parsed.get("reasoning", "")),
-            "key_assumptions": list(parsed.get("key_assumptions", [])),
-            "key_uncertainties": list(parsed.get("key_uncertainties", [])),
-            "would_change_if": parsed.get("would_change_if"),
-            "status": "success",
-            "latency_ms": round(latency_ms, 1),
-        }
+        parsed = parse_specialist_response(raw)
+        parsed["specialist"] = name
+        parsed["model"] = model
+        parsed["latency_ms"] = latency_ms
+        return parsed
 
     except asyncio.TimeoutError:
-        latency_ms = (time.time() - t0) * 1000
+        latency_ms = round((time.time() - t0) * 1000, 1)
         logger.warning(f"[Augur] {name} timed out after {timeout_seconds}s")
         return {
-            "specialist": name, "probability": 0.5, "confidence": 0.0,
+            "specialist": name, "model": model,
             "reasoning": f"Specialist timed out after {timeout_seconds}s.",
-            "key_assumptions": [], "key_uncertainties": [],
-            "would_change_if": None,
-            "status": "timeout", "latency_ms": round(latency_ms, 1),
-        }
-    except json.JSONDecodeError as exc:
-        latency_ms = (time.time() - t0) * 1000
-        logger.warning(f"[Augur] {name} returned non-JSON: {exc}")
-        return {
-            "specialist": name, "probability": 0.5, "confidence": 0.0,
-            "reasoning": "Specialist returned unparseable response.",
-            "key_assumptions": [], "key_uncertainties": [],
-            "would_change_if": None,
-            "status": "parse_error", "latency_ms": round(latency_ms, 1),
+            "status": "timeout", "latency_ms": latency_ms,
+            **_ERROR_RESULT,
         }
     except Exception as exc:
-        latency_ms = (time.time() - t0) * 1000
+        latency_ms = round((time.time() - t0) * 1000, 1)
         logger.warning(f"[Augur] {name} error: {exc}")
         return {
-            "specialist": name, "probability": 0.5, "confidence": 0.0,
+            "specialist": name, "model": model,
             "reasoning": f"Specialist call failed: {type(exc).__name__}",
-            "key_assumptions": [], "key_uncertainties": [],
-            "would_change_if": None,
-            "status": "api_error", "latency_ms": round(latency_ms, 1),
+            "status": "api_error", "latency_ms": latency_ms,
+            **_ERROR_RESULT,
         }
 
 
@@ -253,15 +241,20 @@ async def call_specialist(
 # Synthesis pass
 # ---------------------------------------------------------------------------
 
+# Preferred models for synthesis (cheap, fast), tried in order.
+_SYNTHESIS_MODELS = [
+    ("claude-haiku-4-5-20251001", Provider.ANTHROPIC),
+    ("gpt-4o-mini", Provider.OPENAI),
+    ("gemini-2.0-flash", Provider.GOOGLE),
+]
+
+
 async def synthesize(
     question: str,
     estimates: list,
     ensemble_prob: float,
-    api_key: str,
 ) -> Optional[str]:
     """One final LLM call to explain what the ensemble found and why."""
-    import anthropic
-
     summaries = "\n".join(
         f"- {e['specialist']} ({e['probability']:.0%}, conf={e['confidence']:.0%}): {e['reasoning'][:300]}"
         for e in estimates if e["status"] == "success"
@@ -280,18 +273,28 @@ async def synthesize(
         "Be specific — reference the actual reasoning above."
     )
 
+    # Pick the first available cheap model for synthesis
+    avail = available_providers()
+    model, provider = None, None
+    for m, p in _SYNTHESIS_MODELS:
+        if avail.get(p):
+            model, provider = m, p
+            break
+    if model is None:
+        logger.warning("[Augur] No provider available for synthesis")
+        return None
+
     try:
-        client = anthropic.AsyncAnthropic(api_key=api_key)
-        response = await asyncio.wait_for(
-            client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=300,
-                temperature=0.3,
-                messages=[{"role": "user", "content": prompt}],
-            ),
+        raw = await send_message(
+            model=model,
+            provider=provider,
+            system="You are a concise forecasting synthesis assistant.",
+            user=prompt,
+            temperature=0.3,
+            max_tokens=300,
             timeout=30,
         )
-        return response.content[0].text.strip()
+        return raw.strip()
     except Exception as exc:
         logger.warning(f"[Augur] Synthesis failed: {exc}")
         return None

@@ -3,8 +3,8 @@ name = "intelligence_analyst"
 version = "1.0.0"
 
 [model]
-primary = "deepseek/deepseek-r1-0528"
-fallback = "deepseek/deepseek-v3-0324"
+primary = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5-20251001"
 local = "tomng/nanbeige4.1:3b"
 temperature = 0.4
 max_tokens = 8192

@@ -3,8 +3,8 @@ name = "researcher"
 version = "1.0.0"
 
 [model]
-primary = "deepseek/deepseek-r1-0528"
-fallback = "deepseek/deepseek-v3-0324"
+primary = "gemini-2.5-flash"
+fallback = "gemini-2.0-flash"
 local = "tomng/nanbeige4.1:3b"
 temperature = 0.5
 max_tokens = 8192

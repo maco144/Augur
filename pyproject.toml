@@ -20,6 +20,8 @@ classifiers = [
 ]
 dependencies = [
     "anthropic>=0.25",
+    "openai>=1.30",
+    "google-genai>=1.0",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.29",
     "pydantic>=2.5",
