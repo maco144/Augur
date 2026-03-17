@@ -1,9 +1,8 @@
 """Tests for the Augur forecast API."""
 from __future__ import annotations
 
-import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import httpx
@@ -25,8 +24,9 @@ async def _req(method: str, path: str, **kwargs) -> httpx.Response:
         return await client.request(method, path, **kwargs)
 
 
-def _mock_anthropic_response(probability: float, confidence: float, reasoning: str = "test") -> MagicMock:
-    payload = json.dumps({
+def _mock_send_response(probability: float, confidence: float, reasoning: str = "test") -> str:
+    """Return a raw JSON string as send_message would."""
+    return json.dumps({
         "probability": probability,
         "confidence": confidence,
         "reasoning": reasoning,
@@ -34,9 +34,17 @@ def _mock_anthropic_response(probability: float, confidence: float, reasoning: s
         "key_uncertainties": ["uncertainty B"],
         "would_change_if": "New evidence would change this.",
     })
-    msg = MagicMock()
-    msg.content = [MagicMock(text=payload)]
-    return msg
+
+
+def _one_provider_available():
+    """Patch available_providers to report at least one key."""
+    from augur.router import Provider
+    return {Provider.ANTHROPIC: True, Provider.OPENAI: False, Provider.GOOGLE: False, Provider.OPENROUTER: False}
+
+
+def _no_providers_available():
+    from augur.router import Provider
+    return {Provider.ANTHROPIC: False, Provider.OPENAI: False, Provider.GOOGLE: False, Provider.OPENROUTER: False}
 
 
 class TestListSpecialists:
@@ -70,14 +78,14 @@ class TestListSpecialists:
 class TestRunForecast:
 
     @pytest.mark.asyncio
-    async def test_missing_api_key_returns_503(self):
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": ""}):
+    async def test_no_providers_returns_503(self):
+        with patch("augur.api.available_providers", return_value=_no_providers_available()):
             resp = await _req("POST", "/v1/forecast", json={"question": "Will X happen?"})
         assert resp.status_code == 503
 
     @pytest.mark.asyncio
     async def test_unknown_specialist_returns_422(self):
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        with patch("augur.api.available_providers", return_value=_one_provider_available()):
             resp = await _req("POST", "/v1/forecast", json={
                 "question": "Will X?",
                 "specialists": ["nonexistent_xyz"],
@@ -86,12 +94,11 @@ class TestRunForecast:
 
     @pytest.mark.asyncio
     async def test_successful_forecast_shape(self):
-        mock_msg = _mock_anthropic_response(0.7, 0.8)
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=mock_msg)
+        raw_response = _mock_send_response(0.7, 0.8)
 
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}), \
-             patch("anthropic.AsyncAnthropic", return_value=mock_client), \
+        with patch("augur.api.available_providers", return_value=_one_provider_available()), \
+             patch("augur.engine.send_message", new_callable=AsyncMock, return_value=raw_response), \
+             patch("augur.engine.resolve_model", return_value=("claude-sonnet-4-6", "anthropic")), \
              patch("augur.engine.synthesize", new_callable=AsyncMock, return_value="Synthesis text."):
             resp = await _req("POST", "/v1/forecast", json={
                 "question": "Will the Fed cut rates before September 2026?",
@@ -103,28 +110,29 @@ class TestRunForecast:
         assert "ensemble_probability" in body
         assert "ensemble_confidence" in body
         assert "consensus" in body
+        assert "models_used" in body
         assert body["successful"] == 1
         assert body["failed"] == 0
+        # Specialist should include model field
+        assert body["specialists"][0]["model"] == "claude-sonnet-4-6"
 
     @pytest.mark.asyncio
     async def test_ensemble_probability_is_weighted_average(self):
         responses = [
-            _mock_anthropic_response(0.6, 1.0),
-            _mock_anthropic_response(0.8, 1.0),
+            _mock_send_response(0.6, 1.0),
+            _mock_send_response(0.8, 1.0),
         ]
         call_count = 0
 
-        async def fake_create(**kwargs):
+        async def fake_send(**kwargs):
             nonlocal call_count
             r = responses[call_count % len(responses)]
             call_count += 1
             return r
 
-        mock_client = AsyncMock()
-        mock_client.messages.create = fake_create
-
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}), \
-             patch("anthropic.AsyncAnthropic", return_value=mock_client), \
+        with patch("augur.api.available_providers", return_value=_one_provider_available()), \
+             patch("augur.engine.send_message", side_effect=fake_send), \
+             patch("augur.engine.resolve_model", return_value=("claude-sonnet-4-6", "anthropic")), \
              patch("augur.engine.synthesize", new_callable=AsyncMock, return_value=None):
             resp = await _req("POST", "/v1/forecast", json={
                 "question": "Test question?",
@@ -136,11 +144,9 @@ class TestRunForecast:
 
     @pytest.mark.asyncio
     async def test_all_failed_gives_neutral_ensemble(self):
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(side_effect=Exception("API down"))
-
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}), \
-             patch("anthropic.AsyncAnthropic", return_value=mock_client), \
+        with patch("augur.api.available_providers", return_value=_one_provider_available()), \
+             patch("augur.engine.send_message", new_callable=AsyncMock, side_effect=Exception("API down")), \
+             patch("augur.engine.resolve_model", return_value=("claude-sonnet-4-6", "anthropic")), \
              patch("augur.engine.synthesize", new_callable=AsyncMock, return_value=None):
             resp = await _req("POST", "/v1/forecast", json={
                 "question": "Test?",
@@ -158,14 +164,11 @@ class TestRunForecast:
             "probability": 0.55, "confidence": 0.6,
             "reasoning": "ok", "key_assumptions": [], "key_uncertainties": [],
         })
-        fenced_msg = MagicMock()
-        fenced_msg.content = [MagicMock(text=f"```json\n{payload}\n```")]
+        fenced_response = f"```json\n{payload}\n```"
 
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=fenced_msg)
-
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}), \
-             patch("anthropic.AsyncAnthropic", return_value=mock_client), \
+        with patch("augur.api.available_providers", return_value=_one_provider_available()), \
+             patch("augur.engine.send_message", new_callable=AsyncMock, return_value=fenced_response), \
+             patch("augur.engine.resolve_model", return_value=("claude-sonnet-4-6", "anthropic")), \
              patch("augur.engine.synthesize", new_callable=AsyncMock, return_value=None):
             resp = await _req("POST", "/v1/forecast", json={
                 "question": "Test?",
@@ -175,3 +178,43 @@ class TestRunForecast:
         s = resp.json()["specialists"][0]
         assert s["status"] == "success"
         assert abs(s["probability"] - 0.55) < 0.001
+
+    @pytest.mark.asyncio
+    async def test_models_used_reflects_diverse_models(self):
+        """When specialists use different models, models_used should list all of them."""
+        from augur.router import Provider
+
+        responses = [
+            _mock_send_response(0.6, 0.8),
+            _mock_send_response(0.7, 0.8),
+        ]
+        call_count = 0
+
+        async def fake_send(**kwargs):
+            nonlocal call_count
+            r = responses[call_count % len(responses)]
+            call_count += 1
+            return r
+
+        models = [("deepseek/deepseek-r1-0528", Provider.OPENROUTER), ("claude-sonnet-4-6", Provider.ANTHROPIC)]
+        resolve_count = 0
+
+        def fake_resolve(cfg):
+            nonlocal resolve_count
+            m = models[resolve_count % len(models)]
+            resolve_count += 1
+            return m
+
+        with patch("augur.api.available_providers", return_value=_one_provider_available()), \
+             patch("augur.engine.send_message", side_effect=fake_send), \
+             patch("augur.engine.resolve_model", side_effect=fake_resolve), \
+             patch("augur.engine.synthesize", new_callable=AsyncMock, return_value=None):
+            resp = await _req("POST", "/v1/forecast", json={
+                "question": "Test?",
+                "specialists": ["reasoner", "intelligence_analyst"],
+            })
+
+        body = resp.json()
+        assert len(body["models_used"]) == 2
+        assert "deepseek/deepseek-r1-0528" in body["models_used"]
+        assert "claude-sonnet-4-6" in body["models_used"]

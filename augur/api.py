@@ -5,11 +5,12 @@ Endpoints:
     POST /v1/forecast                  — Run an ensemble forecast across specialists
     GET  /v1/forecast/specialists      — List available specialist forecasters
     GET  /v1/forecast/history          — Recent forecast history
+    POST /v1/forecast/resolve          — Mark a forecast as resolved with actual outcome
+    GET  /v1/forecast/calibration      — Calibration curve data with confidence intervals
 """
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 import logging
 from typing import List, Optional
@@ -27,6 +28,10 @@ from .engine import (
     synthesize,
     weighted_average,
 )
+from .router import available_providers
+from .base_rates import get_base_rates, list_categories, search_base_rates
+from .calibration import calibration_report, resolve_forecast
+from .divergence import detect_divergence, notify_divergence
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +72,7 @@ class ForecastRequest(BaseModel):
 
 class SpecialistEstimate(BaseModel):
     specialist: str
+    model: str = ""
     probability: float
     confidence: float
     reasoning: str
@@ -75,6 +81,15 @@ class SpecialistEstimate(BaseModel):
     would_change_if: Optional[str] = None
     status: str  # "success" | "timeout" | "parse_error" | "api_error"
     latency_ms: float
+
+
+class ResolveRequest(BaseModel):
+    question: str = Field(description="The question text to match against forecast history.")
+    actual_outcome: bool = Field(description="True if the forecasted event occurred, False otherwise.")
+    ensemble_probability: Optional[float] = Field(
+        None,
+        description="Override: provide the ensemble probability directly instead of matching history.",
+    )
 
 
 class ForecastResponse(BaseModel):
@@ -90,11 +105,15 @@ class ForecastResponse(BaseModel):
         None,
         description="LLM-generated explanation of specialist agreement/disagreement.",
     )
+    divergence: Optional[dict] = Field(
+        None,
+        description="Divergence info when 3+ specialists disagree by >20pp. None if no significant divergence.",
+    )
     specialists: List[SpecialistEstimate]
     successful: int
     failed: int
     latency_ms: float
-    model_used: str
+    models_used: List[str] = Field(description="Unique model strings used across specialists")
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +156,9 @@ async def run_forecast(body: ForecastRequest) -> ForecastResponse:
     independently estimates the probability, and explains its reasoning.
     Responses are aggregated via confidence-weighted average.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    avail = available_providers()
+    if not any(avail.values()):
+        raise HTTPException(status_code=503, detail="No LLM provider API keys configured")
 
     specialist_names = body.specialists or DEFAULT_SPECIALISTS
     specialists_dir = get_specialists_dir()
@@ -153,7 +172,7 @@ async def run_forecast(body: ForecastRequest) -> ForecastResponse:
 
     # Fan out to all specialists in parallel
     tasks = [
-        call_specialist(name, body.question, body.context, body.timeout_seconds, api_key)
+        call_specialist(name, body.question, body.context, body.timeout_seconds)
         for name in specialist_names
     ]
     raw_estimates: list[dict] = await asyncio.gather(*tasks)
@@ -165,7 +184,17 @@ async def run_forecast(body: ForecastRequest) -> ForecastResponse:
     # Optional synthesis pass
     synthesis_text = None
     if body.synthesize and successful > 0:
-        synthesis_text = await synthesize(body.question, raw_estimates, ensemble_prob, api_key)
+        synthesis_text = await synthesize(body.question, raw_estimates, ensemble_prob)
+
+    # Divergence detection
+    divergence_info = detect_divergence(raw_estimates)
+    if divergence_info:
+        logger.warning(
+            f"[Augur] Divergence detected: spread={divergence_info['spread_pp']}pp "
+            f"divergent={divergence_info['num_divergent']}/{divergence_info['num_successful']}"
+        )
+        # Fire-and-forget webhook notifications
+        asyncio.create_task(notify_divergence(body.question, divergence_info))
 
     total_latency_ms = round((time.time() - t0) * 1000, 1)
 
@@ -185,6 +214,7 @@ async def run_forecast(body: ForecastRequest) -> ForecastResponse:
         "failed": failed,
         "latency_ms": total_latency_ms,
         "specialist_count": len(raw_estimates),
+        "divergence_flags": divergence_info,
         "timestamp": time.time(),
     })
     if len(_forecast_history) > _MAX_HISTORY:
@@ -193,15 +223,66 @@ async def run_forecast(body: ForecastRequest) -> ForecastResponse:
     # Convert raw dicts to Pydantic models
     estimates = [SpecialistEstimate(**e) for e in raw_estimates]
 
+    models_used = sorted(set(e["model"] for e in raw_estimates if e.get("model")))
+
     return ForecastResponse(
         question=body.question,
         ensemble_probability=ensemble_prob,
         ensemble_confidence=ensemble_conf,
         consensus=consensus_label(ensemble_prob),
         synthesis=synthesis_text,
+        divergence=divergence_info,
         specialists=estimates,
         successful=successful,
         failed=failed,
         latency_ms=total_latency_ms,
-        model_used="claude-sonnet-4-6",
+        models_used=models_used,
     )
+
+
+@router.post("/resolve", summary="Mark a forecast as resolved with actual outcome")
+async def resolve(body: ResolveRequest) -> dict:
+    """Record that a previously-forecasted question resolved to a known outcome."""
+    try:
+        record = resolve_forecast(
+            question=body.question,
+            actual_outcome=body.actual_outcome,
+            ensemble_probability=body.ensemble_probability,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"status": "resolved", "record": record}
+
+
+@router.get("/calibration", summary="Calibration curve with confidence intervals")
+async def get_calibration(quarter: Optional[str] = Query(None, description="Filter to a quarter, e.g. '2026-Q1'")) -> dict:
+    """
+    Return calibration dashboard data: bucketed confidence-vs-resolution rates
+    with Wilson score confidence intervals, Brier score, grouped by quarter.
+    """
+    return calibration_report(quarter=quarter)
+
+
+@router.get("/base-rates", summary="Reference class base-rate library")
+async def get_base_rate_library(
+    category: Optional[str] = Query(None, description="Filter by category (e.g. 'markets', 'ai_ml', 'healthcare')"),
+    q: Optional[str] = Query(None, description="Keyword search across all base-rate entries"),
+) -> dict:
+    """
+    Return structured base-rate anchoring templates for reference class forecasting.
+
+    Use these historical frequencies to anchor probability estimates before adjusting
+    for question-specific factors.  Supports filtering by category or free-text search.
+    """
+    if q:
+        entries = search_base_rates(q)
+    elif category:
+        entries = get_base_rates(category)
+    else:
+        from .base_rates import BASE_RATE_REGISTRY
+        entries = list(BASE_RATE_REGISTRY)
+    return {
+        "base_rates": entries,
+        "count": len(entries),
+        "categories": list_categories(),
+    }
