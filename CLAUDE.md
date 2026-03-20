@@ -9,7 +9,9 @@ See `PROJECT_INDEX.md` for full structure.
 ```
 augur/__init__.py              # Package init, version
 augur/engine.py                # Core engine: specialist calls, aggregation, synthesis
-augur/api.py                   # FastAPI routes + Pydantic models
+augur/api.py                   # FastAPI routes + Pydantic models (ensemble forecasting)
+augur/submissions.py           # Dual-pool open submission system (questions, submissions, leaderboard)
+augur/scoring.py               # Scoring engine: Brier, novelty, pool multipliers, reputation
 augur/server.py                # FastAPI app entrypoint
 augur/specialists/             # TOML playbook manifests (one per specialist)
   reasoner.toml                #   9-phase structured reasoning
@@ -19,6 +21,8 @@ augur/specialists/             # TOML playbook manifests (one per specialist)
   data_scientist.toml          #   Bayesian reasoning, base rates
 tests/test_engine.py           # Unit tests (weighted_average, consensus_label)
 tests/test_api.py              # Integration tests (mocked Anthropic client)
+tests/test_scoring.py          # Scoring math tests (Brier, novelty, multipliers)
+tests/test_submissions.py      # Dual-pool submission lifecycle tests
 ```
 
 ## Running
@@ -58,6 +62,8 @@ Dev: `pytest>=8`, `pytest-asyncio>=0.23`, `httpx>=0.27`, `ruff>=0.4`
 - **In-memory history**: Forecast history is per-process, max 200 entries, not persisted.
 - **Environment**: `ANTHROPIC_API_KEY` required. `AUGUR_SPECIALISTS_DIR` optionally overrides specialist TOML location.
 - **Config**: `pyproject.toml` — hatch build, ruff target py311 line-length 120, pytest asyncio_mode auto.
+- **Dual-pool submissions**: Every question gets open + dark pools. Open pool is visible; dark pool is sealed until deadline or resolution. Scoring uses pool multipliers: dark = `1 + confidence` (conviction), open = `1 + time_remaining_pct` (early mover). Combined score = `(quality * α + novelty * (1-α)) * multiplier`. The spread between pool aggregates measures herding/anchoring.
+- **Participant reputation**: Rolling combined score across resolved submissions feeds back as aggregation weight (min 5 resolved, floor 0.1).
 
 ## Proprietary Boundaries
 
@@ -76,12 +82,28 @@ Dev: `pytest>=8`, `pytest-asyncio>=0.23`, `httpx>=0.27`, `ruff>=0.4`
 
 ## API
 
+### Ensemble Forecasting (internal specialists)
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/v1/forecast` | Run ensemble forecast |
 | `GET` | `/v1/forecast/specialists` | List available specialists |
 | `GET` | `/v1/forecast/history` | Recent forecast history |
 | `GET` | `/health` | Health check |
+
+### Open Submission System (dual-pool)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/v1/questions` | Register a question (auto-creates open + dark pools) |
+| `GET` | `/v1/questions` | List questions (`?status=open\|resolved\|all`) |
+| `GET` | `/v1/questions/{id}` | Question + per-pool aggregates + spread |
+| `POST` | `/v1/questions/{id}/submit` | Submit prediction (`"pool": "open"\|"dark"`) |
+| `GET` | `/v1/questions/{id}/submissions` | List submissions (`?pool=open\|dark`) |
+| `POST` | `/v1/questions/{id}/resolve` | Resolve + score all submissions |
+| `POST` | `/v1/participants` | Register participant (agent/human/ensemble) |
+| `GET` | `/v1/participants/{id}` | Participant profile + rolling stats |
+| `GET` | `/v1/leaderboard` | Ranked by combined score |
 
 ## AIOS Portfolio Integration
 
