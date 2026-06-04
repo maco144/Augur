@@ -10,3 +10,6 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Internal instructions — never publish
+CLAUDE.md
